@@ -1,352 +1,341 @@
-# Encrypted Player Registry · Zama FHEVM
+# Encrypted Character Progress
 
-A minimal demo dApp that showcases how to build a privacy‑preserving player registry on top of the **Zama FHEVM**.
+Private on-chain character growth powered by **Zama FHEVM**.
+XP and skills are stored as encrypted ciphertexts on Ethereum Sepolia – only the player can decrypt their clear values locally via the Relayer SDK.
 
-Each player registers with:
-
-* a **public name** stored in plaintext (for leaderboards / UX), and
-* a **fully homomorphic encrypted age** stored as an `euint8` in the smart contract.
-
-The age is never revealed on-chain in clear form. The player can decrypt their own age off‑chain using the **Relayer SDK 0.2.0** and an EIP‑712 signature.
+> **Concept:**
+> Upgrade your game character on-chain without ever revealing raw XP or skill numbers. The contract sees only encrypted inputs and performs all updates under Fully Homomorphic Encryption (FHE).
 
 ---
 
-## Tech stack
+## ✨ Overview
 
-* **Smart contract**: Solidity `^0.8.24`
+This project demonstrates how to build **privacy-preserving game progression** using Zama’s FHEVM:
 
-  * `@fhevm/solidity` (Zama FHE library)
-  * `SepoliaConfig` from Zama FHEVM config
-* **Frontend**: single‑page HTML app
+* Each **character** is identified by a `characterId` (1, 2, 3, …) per wallet.
+* For every character, the contract stores:
 
-  * `@zama-fhe/relayer-sdk` **0.2.0** (browser build)
-  * `ethers` **v6** (ESM, `BrowserProvider`, `Contract`)
-* **Network**: Sepolia FHEVM (testnet)
-* **Tooling**: Hardhat + hardhat‑deploy (backend), static web server (frontend)
+  * Encrypted **XP** (`euint32`)
+  * Encrypted **four skill stats** (`euint16[4]`)
+* Players:
 
-Frontend entry point lives at:
+  * Initialize a character with encrypted stats (`createCharacter`)
+  * Apply encrypted XP/skill deltas (`updateCharacterProgress`)
+  * Privately decrypt their stats via **Relayer `userDecrypt`** on the frontend.
+* The chain never learns the underlying XP/skill numbers — only ciphertexts and handles.
+
+---
+
+## 🧠 FHE Model & Game Logic
+
+### Data model
+
+For each player address and `characterId`, the contract (conceptually) keeps:
+
+* `euint32 eXp` – encrypted XP
+* `euint16 eSkill1`
+* `euint16 eSkill2`
+* `euint16 eSkill3`
+* `euint16 eSkill4`
+* `bool exists` – whether this character has been initialized
+
+All of these encrypted values live in FHEVM memory and are only manipulated using the Zama FHE library.
+
+### Key operations
+
+1. **Create character (encrypted init)**
+
+   ```solidity
+   function createCharacter(
+     uint256 characterId,
+     externalEuint32 encXp,
+     externalEuint16 encSkill1,
+     externalEuint16 encSkill2,
+     externalEuint16 encSkill3,
+     externalEuint16 encSkill4,
+     bytes calldata proof
+   ) external;
+   ```
+
+   High level:
+
+   * Frontend encrypts initial `xp` + `skill[4]` via Relayer SDK.
+   * Gateway returns encrypted handles + proof.
+   * Contract ingests them with `FHE.fromExternal(...)` and stores as `euint32` / `euint16` values.
+   * Access control: `FHE.allowThis` for the contract, `FHE.allow(..., msg.sender)` so only the player can decrypt later.
+
+2. **Apply encrypted progress (XP & skills deltas)**
+
+   ```solidity
+   function updateCharacterProgress(
+     uint256 characterId,
+     externalEuint32 encDeltaXp,
+     externalEuint16 encDeltaSkill1,
+     externalEuint16 encDeltaSkill2,
+     externalEuint16 encDeltaSkill3,
+     externalEuint16 encDeltaSkill4,
+     bytes calldata proof
+   ) external;
+   ```
+
+   Logic (conceptual, under FHE):
+
+   ```solidity
+   euint32 eDeltaXp = FHE.fromExternal(encDeltaXp, proof);
+   euint16 eDeltaS1 = FHE.fromExternal(encDeltaSkill1, proof);
+   ...
+   // All FHE ops:
+   S.eXp      = FHE.add(S.eXp, eDeltaXp);
+   S.eSkill1  = FHE.add(S.eSkill1, eDeltaS1);
+   S.eSkill2  = FHE.add(S.eSkill2, eDeltaS2);
+   S.eSkill3  = FHE.add(S.eSkill3, eDeltaS3);
+   S.eSkill4  = FHE.add(S.eSkill4, eDeltaS4);
+   ```
+
+   Constraints:
+
+   * Deltas are **non-negative** (no refunds).
+   * All arithmetic happens on ciphertexts, without revealing numbers.
+
+3. **View handles for decryption**
+
+   ```solidity
+   function getMyCharacterHandles(uint256 characterId)
+     external
+     view
+     returns (
+       bytes32 xpHandle,
+       bytes32 skill1Handle,
+       bytes32 skill2Handle,
+       bytes32 skill3Handle,
+       bytes32 skill4Handle,
+       bool exists
+     );
+   ```
+
+   The frontend uses these handles + Relayer SDK `userDecrypt` to recover clear XP/skills **locally only**.
+
+4. **Meta & owner helper**
+
+   * `getCharacterMeta(player, characterId) -> bool exists`
+   * `getCharacterXpHandleForOwner(player, characterId)` – optional hook if the game owner wants to run off-chain analytics with proper ACL.
+
+---
+
+## 🔐 Privacy & FHE Flow
+
+### End-to-end pipeline
+
+1. **Encrypt on the frontend**
+
+   ```ts
+   const buf = relayer.createEncryptedInput(CONTRACT_ADDRESS, userAddress);
+   buf.add32(xp);
+   buf.add16(skill1);
+   buf.add16(skill2);
+   buf.add16(skill3);
+   buf.add16(skill4);
+
+   const { handles, inputProof } = await buf.encrypt();
+   // send to createCharacter / updateCharacterProgress
+   ```
+
+2. **Ingest & update on-chain (contract)**
+
+   ```solidity
+   euint32 eXp = FHE.fromExternal(encXp, proof);
+   euint16 eS1 = FHE.fromExternal(encSkill1, proof);
+   // ... store and update under encryption
+   ```
+
+3. **Expose only handles**
+
+   ```solidity
+   function getMyCharacterHandles(uint256 characterId)
+     external
+     view
+     returns (bytes32, bytes32, bytes32, bytes32, bytes32, bool);
+   ```
+
+4. **Decrypt locally (frontend)**
+
+   ```ts
+   const { out, pairs } = await relayer.userDecrypt(...);
+   // Map out -> handles, then show clear values in the UI only.
+   ```
+
+At no point does the contract learn raw XP/skill numbers.
+
+---
+
+## 🕹 Frontend UX
+
+The sample frontend is a single-page HTML/JS app using **ethers v6** and Zama’s **Relayer SDK** via CDN.
+
+### Main sections
+
+1. **Hero & connection panel**
+
+   * Shows project title and short explanation.
+   * Wallet connect button (MetaMask / EIP-1193).
+   * Displays current network (Sepolia), user address and contract address.
+   * Shows whether HTTPS is being used (recommended for WASM worker & userDecrypt).
+
+2. **Character slot selector**
+
+   * Choose the `characterId` to work with.
+   * Quick buttons for ID `#1` and `#2`.
+   * "Check character on-chain" button calls `getCharacterMeta` and shows whether encrypted stats exist.
+
+3. **Create encrypted character**
+
+   * Inputs:
+
+     * Initial XP (`uint32`)
+     * Skill I / II / III / IV (`uint16` each)
+   * Flow:
+
+     * Encrypts all values client-side via Relayer SDK (`createEncryptedInput`).
+     * Sends handles + proof to `createCharacter`.
+     * Shows tx hash and status.
+
+4. **Apply encrypted progress**
+
+   * Inputs:
+
+     * XP delta (`uint32`)
+     * Skill I–IV deltas (`uint16` each)
+   * Flow:
+
+     * Encrypts deltas via Relayer SDK.
+     * Calls `updateCharacterProgress` with encrypted deltas.
+     * All XP/skills are updated fully under FHE.
+
+5. **Decrypt my encrypted stats**
+
+   * Button: `Decrypt stats for this ID`.
+   * Steps:
+
+     * Fetches handles from `getMyCharacterHandles(characterId)`.
+     * Builds a `userDecrypt` request (short-lived keypair + EIP-712 typed data).
+     * Displays clear XP & skill values **only in the browser** (never sent on-chain).
+   * If no character exists yet, shows a clear warning.
+
+### userDecrypt / BigInt handling
+
+The frontend follows best practices for Zama Relayer responses:
+
+* Uses a `safeStringify` helper to avoid `BigInt` JSON issues in logs.
+* Normalizes `userDecrypt` results with a dedicated helper so values of types `bigint | number | boolean | string` are handled safely.
+* Never calls `JSON.stringify` directly on objects containing `BigInt` without the custom replacer.
+
+---
+
+## 🧱 Project Structure
+
+A minimal repo structure might look like this:
 
 ```text
-frontend/public/index.html
+root/
+├─ contracts/
+│  └─ EncryptedCharacterProgress.sol
+├─ frontend/
+│  └─ index.html          # Single-page app using ethers + Relayer SDK CDN
+├─ hardhat.config.ts      # Or foundry / other tooling
+├─ package.json
+├─ README.md              # This file
+└─ scripts/
+   └─ deploy.ts           # Example deploy script (optional)
 ```
+
+You can adapt the layout to your favorite stack (Hardhat, Foundry, wagmi, etc.).
 
 ---
 
-## Main idea
+## 🚀 Getting Started
 
-The dApp demonstrates a simple pattern for Zama FHEVM:
-
-1. The user encrypts sensitive data (age) **in the browser** using the Relayer SDK.
-2. The encrypted value is sent to the smart contract as an `externalEuint8` handle + `proof`.
-3. The contract converts this into an `euint8` and stores it in state.
-4. The user can later:
-
-   * Inspect the **encrypted age handle** on-chain, and
-   * Use **userDecrypt** with an EIP‑712 signature to recover their age off‑chain.
-
-This pattern is reusable for any “profile with private fields” system.
-
----
-
-## Smart contract overview
-
-Contract name: `EncryptedPlayerRegistry`
-
-Key properties:
-
-* Uses only official Zama FHE Solidity library:
-
-  * `import { FHE, euint8, externalEuint8 } from "@fhevm/solidity/lib/FHE.sol";`
-* Extends `SepoliaConfig` for the FHEVM network configuration.
-* Encrypted fields are always stored as `euint8` and **never decrypted on-chain**.
-* Access control over ciphertexts is handled via:
-
-  * `FHE.allowThis(ciphertext)`
-  * `FHE.allow(ciphertext, user)`
-  * `FHE.makePubliclyDecryptable(ciphertext)` for opt‑in public auditability.
-
-### Storage
-
-```solidity
-struct Player {
-    bool exists;   // registration flag
-    string name;   // public display name
-    euint8 age;    // encrypted age
-}
-
-mapping(address => Player) private _players;
-address public owner;
-```
-
-* `name` is stored in the clear.
-* `age` is an encrypted `euint8`.
-
-### Public / player functions
-
-* `registerEncrypted(string name, externalEuint8 ageExt, bytes proof)`
-
-  * Encrypt age in the browser using the Relayer SDK.
-  * Call this function with the encrypted handle and proof.
-  * Contract:
-
-    * calls `FHE.fromExternal(ageExt, proof)` → `euint8` ciphertext;
-    * stores it in `_players[msg.sender].age`;
-    * uses `FHE.allowThis` and `FHE.allow(ciphertext, msg.sender)`.
-
-* `registerPlain(string name, uint8 agePlain)`
-
-  * Dev/demo helper.
-  * Converts plaintext `agePlain` into ciphertext using `FHE.asEuint8` on-chain.
-
-* `updateName(string newName)`
-
-  * Updates only the public `name` field.
-
-* `updateAgeEncrypted(externalEuint8 newAgeExt, bytes proof)`
-
-  * Updates only the encrypted age.
-
-* `isRegistered(address player) -> bool`
-
-  * Returns whether a player has a profile.
-
-* `getPlayer(address player) -> (bool exists, string name, bytes32 ageHandle)`
-
-  * Returns profile metadata and the encrypted age handle (`bytes32`).
-  * `ageHandle` can be fed to public decryption or user decryption off-chain.
-
-* `getMyAgeHandle() -> bytes32`
-
-  * Convenience method to fetch the `bytes32` handle for `msg.sender`’s age.
-
-* `makeMyAgePublic()`
-
-  * Calls `FHE.makePubliclyDecryptable(_players[msg.sender].age)`.
-  * Allows anyone to call `publicDecrypt` on the ciphertext.
-
-### Owner/admin functions
-
-* `owner` / `transferOwnership(address newOwner)`
-
-  * Standard ownership pattern.
-
-* `makePlayerAgePublic(address player)`
-
-  * For audits / demos, owner can force a player’s age to be publicly decryptable.
-
-* `clearPlayer(address player)`
-
-  * Logically clears a player profile.
-  * Sets `exists = false`, wipes `name`, and replaces age with `FHE.asEuint8(0)`.
-  * Avoids using `delete` on `euint8` (not supported).
-
----
-
-## Frontend overview
-
-The frontend is a single `index.html` with:
-
-* A **three‑column layout**:
-
-  * Player onboarding (name + encrypted age).
-  * “My profile” section (view profile, update name/age, decrypt age).
-  * Owner console (mark ages public / clear profiles).
-* A **dark neon UI** designed to be visually distinct from other demos.
-* Uses **Relayer SDK 0.2.0** and **ethers v6** via ESM CDNs.
-
-Key flows:
-
-### 1. Connect wallet & Relayer
-
-* Uses `BrowserProvider(window.ethereum)` from ethers v6.
-* Automatically switches to Sepolia (chain id `0xaa36a7`).
-* Initializes the Relayer with:
-
-```ts
-await initSDK();
-relayer = await createInstance({
-  ...SepoliaConfig,
-  relayerUrl: "https://relayer.testnet.zama.cloud",
-  network: window.ethereum,
-  debug: true,
-});
-```
-
-### 2. Encrypted registration
-
-* User enters `name` + `age`.
-* Frontend calls:
-
-```ts
-const input = relayer.createEncryptedInput(CONTRACT_ADDRESS, user);
-input.add8(age);                      // age is uint8
-const { handles, inputProof } = await input.encrypt();
-
-await contract.registerEncrypted(name, handles[0], inputProof);
-```
-
-### 3. Decrypting age (userDecrypt)
-
-* Frontend calls `getMyAgeHandle()`.
-* Generates an ephemeral keypair with `generateKeypair()`.
-* Builds EIP‑712 data via `relayer.createEIP712(...)`.
-* Uses `signer.signTypedData(...)` (EIP‑712) and then:
-
-```ts
-const pairs = [{ handle, contractAddress: CONTRACT_ADDRESS }];
-const result = await relayer.userDecrypt(
-  pairs,
-  kp.privateKey,
-  kp.publicKey,
-  sig.replace("0x", ""),
-  [CONTRACT_ADDRESS],
-  user,
-  startTs,
-  daysValid,
-);
-```
-
-* Displays the decrypted age **only in the UI**, never sending it back on-chain.
-
----
-
-## Project layout
-
-A minimal layout (simplified):
-
-```text
-.
-├── contracts/
-│   └── EncryptedPlayerRegistry.sol
-├── frontend/
-│   └── public/
-│       └── index.html   # the SPA described above
-├── deploy/
-│   └── universal-deploy.ts
-├── hardhat.config.ts
-├── package.json
-└── README.md
-```
-
----
-
-## Installation & setup
-
-### 1. Clone & install dependencies
+### 1. Clone & install
 
 ```bash
 git clone &lt;this-repo-url&gt;
-cd &lt;this-repo-folder&gt;
+cd &lt;this-repo&gt;
 
-# Install backend deps (Hardhat, hardhat-deploy, etc.)
+# optional – for solidity tooling
 npm install
 ```
 
-If the frontend uses its own `package.json` inside `frontend/`, also run:
+### 2. Deploy contract (if needed)
 
-```bash
-cd frontend
-npm install
-cd ..
+If the contract is not already deployed, use your preferred tool (Hardhat, Foundry) with Zama FHEVM-enabled Sepolia RPC.
+
+Example (pseudo):
+
+```ts
+const factory = await ethers.getContractFactory("EncryptedCharacterProgress");
+const contract = await factory.deploy();
+await contract.deployed();
+console.log("Contract:", contract.address);
 ```
 
-### 2. Environment variables (Hardhat)
+Update the **frontend** constant:
 
-In the project root, create a `.env` file (or update an existing one):
-
-```bash
-SEPOLIA_RPC_URL=https://&lt;your-sepolia-rpc&gt;
-PRIVATE_KEY=0x&lt;your_deployer_private_key&gt;
-
-# Optional for universal-deploy
-CONTRACT_NAME=EncryptedPlayerRegistry
-CONSTRUCTOR_ARGS='[]'
+```js
+const CONTRACT_ADDRESS = "0x..."; // deployed address
 ```
 
-> **Note:** never commit real private keys to Git. Use environment variables or a secure secret manager.
+### 3. Run the frontend
 
-### 3. Compile & deploy the contract
+Simplest: serve `frontend/index.html` over HTTPS (or via the provided dev proxy setup) so `userDecrypt` and WASM workers are happy.
+
+Examples:
 
 ```bash
-npx hardhat clean
-npx hardhat compile
-npx hardhat deploy --network sepolia
+# minimal static server
+npx serve frontend
+
+# or any other HTTPS-capable dev server
 ```
 
-If you use the provided `universal-deploy.ts` script, it will pick up `CONTRACT_NAME` and `CONSTRUCTOR_ARGS` automatically.
-
-Make sure the deployed address matches the one used by the frontend (`CONTRACT_ADDRESS` constant in `index.html`).
+Open the app in your browser, connect your Sepolia wallet, and start creating encrypted characters.
 
 ---
 
-## Running the frontend
+## ⚙️ Tech Stack
 
-Since the frontend is a static HTML SPA using WASM and `Cross-Origin-Opener-Policy`, you should serve it via a local HTTP server (not via `file://`).
-
-From the project root:
-
-```bash
-cd frontend/public
-
-# Simple option: use serve (no config needed)
-npx serve .
-
-# or, if you prefer http-server
-# npx http-server .
-```
-
-Then open the printed URL in your browser (e.g. [http://localhost:3000](http://localhost:3000) or [http://127.0.0.1:8080](http://127.0.0.1:8080)).
-
-Requirements:
-
-* Browser with EIP‑1193 wallet (MetaMask, Rabby…) connected to **Sepolia**.
-* Zama FHEVM RPC configured in your wallet / Hardhat.
+* **Solidity** `^0.8.24`
+* **Zama FHEVM** Solidity library
+* **Zama Relayer SDK (JS)** via CDN
+* **Ethers v6** (BrowserProvider / Contract)
+* **Ethereum Sepolia** as the target network
 
 ---
 
-## How to use the dApp
+## 🧭 Design goals
 
-1. **Connect wallet**
+* Demonstrate a **game-like**, privacy-preserving use case.
+* Keep the contract **FHE-correct**: no FHE ops in view/pure functions; only handles returned.
+* Showcase **frontend patterns** for:
 
-   * Click **“Connect wallet”** in the header.
-   * Approve network switch to Sepolia if prompted.
-
-2. **Register as a player**
-
-   * In **“Player onboarding”** panel:
-
-     * Enter a public display name.
-     * Enter your age (0–255).
-     * Click **“Encrypt & register”**.
-   * Wait for the transaction to confirm.
-
-3. **Inspect your profile**
-
-   * In **“My profile”** panel, click **“Load my profile”**.
-   * You will see:
-
-     * Your name, and
-     * Your encrypted age handle (`bytes32`).
-
-4. **Decrypt your age**
-
-   * Click **“Private decrypt via Relayer”**.
-   * Sign the EIP‑712 message in your wallet.
-   * The decrypted age will appear as a pill in the UI, visible only in your browser.
-
-5. **Owner tools (optional)**
-
-   * If connected as `owner`:
-
-     * Use **“Make age public”** for a target address to enable public decryption.
-     * Use **“Clear profile”** to logically clear a user profile.
+  * Relayer `createEncryptedInput`
+  * `userDecrypt` with EIP-712
+  * Safe handling of `BigInt` / mixed-type decrypt responses.
 
 ---
 
+## 🔮 Ideas for Extensions
 
+* Multiple character classes with different skill layouts.
+* Encrypted level thresholds (XP → level) evaluated fully under FHE.
+* Encrypted leaderboard logic (e.g., comparing characters’ XP privately).
+* Off-chain analytics via `getCharacterXpHandleForOwner` with strict ACL policies.
 
 ---
 
-## License
+## Disclaimer
 
-MIT — feel free to fork, adapt and extend for your own Zama FHEVM demos.
+This project is a **demo** and not production-ready.
+Before using it in a real game or mainnet environment, you should:
+
+* Audit the smart contracts.
+* Review UX, error handling, and edge cases.
+* Validate performance and FHE cost on your
